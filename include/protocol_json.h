@@ -12,6 +12,13 @@ bool protocol_json_extract_timestamp(const char *json, char *out_timestamp, size
 esp_err_t protocol_json_build_status(const char *device_id, const device_state_t *state, char **out_json);
 esp_err_t protocol_json_build_state(const char *device_id, const device_state_t *state, char **out_json);
 esp_err_t protocol_json_build_capabilities(const char *device_id, const device_capabilities_t *capabilities, char **out_json);
+esp_err_t protocol_json_build_diagnostics(
+    const char *device_id,
+    const char *connection_summary,
+    const char *transport_status,
+    const char *last_error_message,
+    char **out_json
+);
 esp_err_t protocol_json_build_schedules_payload(const char *device_id, const app_schedule_store_t *store, char **out_json);
 esp_err_t protocol_json_build_command_ack(
     const char *device_id,

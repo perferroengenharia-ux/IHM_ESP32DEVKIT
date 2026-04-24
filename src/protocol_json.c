@@ -757,6 +757,39 @@ esp_err_t protocol_json_build_capabilities(
     return out(root_object, out_json);
 }
 
+esp_err_t protocol_json_build_diagnostics(
+    const char *device_id,
+    const char *connection_summary,
+    const char *transport_status,
+    const char *last_error_message,
+    char **out_json
+) {
+    cJSON *root_object = root(device_id);
+    cJSON *object = cJSON_CreateObject();
+
+    cJSON_AddStringToObject(object, "firmwareVersion", APP_FIRMWARE_VERSION);
+    cJSON_AddStringToObject(
+        object,
+        "connectionSummary",
+        connection_summary != NULL ? connection_summary : "Diagnostico indisponivel"
+    );
+    cJSON_AddStringToObject(
+        object,
+        "transportStatus",
+        transport_status != NULL ? transport_status : "idle"
+    );
+    cJSON_AddNullToObject(object, "lastSyncAt");
+
+    if (last_error_message != NULL && last_error_message[0] != '\0') {
+        cJSON_AddStringToObject(object, "lastErrorMessage", last_error_message);
+    } else {
+        cJSON_AddNullToObject(object, "lastErrorMessage");
+    }
+
+    cJSON_AddItemToObject(root_object, "diagnostics", object);
+    return out(root_object, out_json);
+}
+
 esp_err_t protocol_json_build_schedules_payload(
     const char *device_id,
     const app_schedule_store_t *store,

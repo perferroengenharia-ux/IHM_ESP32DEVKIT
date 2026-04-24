@@ -5,4 +5,5 @@
 #include "app_types.h"
 esp_err_t wifi_manager_start(const app_wifi_config_t *config);
 bool wifi_manager_is_connected(void);
+bool wifi_manager_is_ap_active(void);
 #endif
