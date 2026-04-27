@@ -26,6 +26,7 @@
 #include "mqtt_app.h"
 #include "mqtt_manager.h"
 #include "schedule_manager.h"
+#include "wifi_manager.h"
 
 static const char *TAG = "IHM_AXON";
 
@@ -374,6 +375,11 @@ static void set_motor_running_ex(bool run, bool skip_timers);
 static void handle_dreno_end(void);
 static esp_err_t dispatch_button_event(button_id_t id, bool long_press);
 static void request_mi_factory_reset(void);
+
+static void refresh_connectivity_indicator_flags(void) {
+    bool local_network_available = wifi_manager_is_connected() || wifi_manager_is_ap_active();
+    wifi_lost = sim_wl || (!mqtt_manager_is_connected() && local_network_available);
+}
 
 /* ============================================================
  * UTILITÃRIOS
@@ -1254,7 +1260,7 @@ static void sim_task(void *arg) {
     (void)arg;
 
     while (1) {
-        wifi_lost = sim_wl;
+        refresh_connectivity_indicator_flags();
         water_shortage = sim_ws || ((g_telemetry.status_flags & MI_STATUS_WATER_SHORTAGE) != 0u);
         dreno_service();
         phase_service();
@@ -1315,7 +1321,7 @@ static void ihm_sync_task(void *arg) {
                 params[IDX_P04].value = g_telemetry.v_out;
                 params[IDX_P05].value = g_telemetry.temp_igbt;
                 water_shortage = sim_ws || ((g_telemetry.status_flags & MI_STATUS_WATER_SHORTAGE) != 0u);
-                wifi_lost = sim_wl;
+                refresh_connectivity_indicator_flags();
                 refresh_run_ready_state_from_output();
 
                 if (g_show_logs) {
@@ -2431,8 +2437,8 @@ esp_err_t ihm_mqtt_adapter_execute_command(const app_command_t *command, command
     esp_err_t err;
     if (command == NULL || result == NULL) return ESP_ERR_INVALID_ARG;
     if (command->type == APP_COMMAND_REQUEST_STATUS || command->type == APP_COMMAND_REQUEST_CAPABILITIES) { mqtt_set_result(result, true, true, APP_LAST_COMMAND_APPLIED, "ok", "Solicitacao recebida"); return ESP_OK; }
-    if (command->type == APP_COMMAND_POWER_ON) { if (mqtt_system_engaged()) { mqtt_set_result(result,true,true,APP_LAST_COMMAND_APPLIED,"ok","Climatizador ja estava ligado"); return ESP_OK; } err = dispatch_button_event(BTN_ONOFF, false); mqtt_set_result(result, err == ESP_OK, err == ESP_OK, err == ESP_OK ? APP_LAST_COMMAND_APPLIED : APP_LAST_COMMAND_FAILED, err == ESP_OK ? "ok" : "command_busy", err == ESP_OK ? "Comando ligar aplicado" : "IHM ocupada"); return err; }
-    if (command->type == APP_COMMAND_POWER_OFF) { if (!mqtt_system_engaged()) { mqtt_set_result(result,true,true,APP_LAST_COMMAND_APPLIED,"ok","Climatizador ja estava desligado"); return ESP_OK; } err = dispatch_button_event(BTN_ONOFF, prewet_active || dryrun_active); mqtt_set_result(result, err == ESP_OK, err == ESP_OK, err == ESP_OK ? APP_LAST_COMMAND_APPLIED : APP_LAST_COMMAND_FAILED, err == ESP_OK ? "ok" : "command_busy", err == ESP_OK ? "Comando desligar aplicado" : "IHM ocupada"); return err; }
+    if (command->type == APP_COMMAND_POWER_ON) { if (command->skip_stage && prewet_active) { err = dispatch_button_event(BTN_ONOFF, true); mqtt_set_result(result, err == ESP_OK, err == ESP_OK, err == ESP_OK ? APP_LAST_COMMAND_APPLIED : APP_LAST_COMMAND_FAILED, err == ESP_OK ? "ok" : "command_busy", err == ESP_OK ? "Etapa de limpeza ignorada" : "IHM ocupada"); return err; } if (mqtt_system_engaged()) { mqtt_set_result(result,true,true,APP_LAST_COMMAND_APPLIED,"ok","Climatizador ja estava ligado"); return ESP_OK; } err = dispatch_button_event(BTN_ONOFF, false); mqtt_set_result(result, err == ESP_OK, err == ESP_OK, err == ESP_OK ? APP_LAST_COMMAND_APPLIED : APP_LAST_COMMAND_FAILED, err == ESP_OK ? "ok" : "command_busy", err == ESP_OK ? "Comando ligar aplicado" : "IHM ocupada"); return err; }
+    if (command->type == APP_COMMAND_POWER_OFF) { if (command->skip_stage && (prewet_active || dryrun_active)) { err = dispatch_button_event(BTN_ONOFF, true); mqtt_set_result(result, err == ESP_OK, err == ESP_OK, err == ESP_OK ? APP_LAST_COMMAND_APPLIED : APP_LAST_COMMAND_FAILED, err == ESP_OK ? "ok" : "command_busy", err == ESP_OK ? "Etapa final ignorada" : "IHM ocupada"); return err; } if (!mqtt_system_engaged()) { mqtt_set_result(result,true,true,APP_LAST_COMMAND_APPLIED,"ok","Climatizador ja estava desligado"); return ESP_OK; } err = dispatch_button_event(BTN_ONOFF, prewet_active || dryrun_active); mqtt_set_result(result, err == ESP_OK, err == ESP_OK, err == ESP_OK ? APP_LAST_COMMAND_APPLIED : APP_LAST_COMMAND_FAILED, err == ESP_OK ? "ok" : "command_busy", err == ESP_OK ? "Comando desligar aplicado" : "IHM ocupada"); return err; }
     if (command->type == APP_COMMAND_SET_FREQUENCY) { err = control_lock(); if (err != ESP_OK) { mqtt_set_result(result,false,false,APP_LAST_COMMAND_FAILED,"command_busy","IHM ocupada"); return err; } if (command->freq_target_hz < params[IDX_P20].value || command->freq_target_hz > params[IDX_P21].value) { control_unlock(); mqtt_set_result(result,false,false,APP_LAST_COMMAND_FAILED,"freq_out_of_range","Frequencia fora de fMinHz e fMaxHz"); return ESP_ERR_INVALID_ARG; } if (dryrun_active) { control_unlock(); mqtt_set_result(result,false,false,APP_LAST_COMMAND_FAILED,"frequency_locked","Frequencia bloqueada durante a secagem"); return ESP_ERR_INVALID_STATE; } target_frequency = command->freq_target_hz; if (params[IDX_P12].value == 1) { saved_frequency = target_frequency; nvs_save_saved_frequency(); } update_display_logic(); control_unlock(); mqtt_set_result(result,true,true,APP_LAST_COMMAND_APPLIED,"ok","Frequencia alvo atualizada"); return ESP_OK; }
     if (command->type == APP_COMMAND_SET_PUMP) { if (params[IDX_P82].value == 0 || params[IDX_P85].value == 0) { mqtt_set_result(result,false,false,APP_LAST_COMMAND_FAILED,"pump_unavailable","Bomba indisponivel"); return ESP_ERR_NOT_SUPPORTED; } if (!system_on) { mqtt_set_result(result,false,false,APP_LAST_COMMAND_FAILED,"system_off","Sistema desligado para controle da bomba"); return ESP_ERR_INVALID_STATE; } if (command->enabled == bomba_on) { mqtt_set_result(result,true,true,APP_LAST_COMMAND_APPLIED,"ok","Bomba ja estava no estado solicitado"); return ESP_OK; } err = dispatch_button_event(command->enabled ? BTN_CLIMATIZAR : BTN_VENTILAR, false); mqtt_set_result(result,err==ESP_OK,err==ESP_OK,err==ESP_OK?APP_LAST_COMMAND_APPLIED:APP_LAST_COMMAND_FAILED,err==ESP_OK?"ok":"pump_blocked",err==ESP_OK?"Bomba atualizada":"Nao foi possivel alterar a bomba"); return err; }
     if (command->type == APP_COMMAND_SET_SWING) { if (params[IDX_P81].value == 0) { mqtt_set_result(result,false,false,APP_LAST_COMMAND_FAILED,"swing_unavailable","Swing indisponivel"); return ESP_ERR_NOT_SUPPORTED; } if (!mqtt_motor_active() || prewet_active || dryrun_active) { mqtt_set_result(result,false,false,APP_LAST_COMMAND_FAILED,"swing_blocked","Swing exige motor em funcionamento"); return ESP_ERR_INVALID_STATE; } if (command->enabled == swing_on) { mqtt_set_result(result,true,true,APP_LAST_COMMAND_APPLIED,"ok","Swing ja estava no estado solicitado"); return ESP_OK; } err = dispatch_button_event(BTN_SWING, false); mqtt_set_result(result,err==ESP_OK,err==ESP_OK,err==ESP_OK?APP_LAST_COMMAND_APPLIED:APP_LAST_COMMAND_FAILED,err==ESP_OK?"ok":"swing_blocked",err==ESP_OK?"Swing atualizado":"Nao foi possivel alterar o swing"); return err; }
@@ -2480,8 +2486,8 @@ static void process_console_command(char *cmd) {
         printf("\n[LOGS OFF]\n");
         return;
     }
-    if (strcasecmp(cmd, "SIMWL1") == 0) { sim_wl = true;  wifi_lost = true; update_display_logic(); return; }
-    if (strcasecmp(cmd, "SIMWL0") == 0) { sim_wl = false; wifi_lost = false; update_display_logic(); return; }
+    if (strcasecmp(cmd, "SIMWL1") == 0) { sim_wl = true;  refresh_connectivity_indicator_flags(); update_display_logic(); return; }
+    if (strcasecmp(cmd, "SIMWL0") == 0) { sim_wl = false; refresh_connectivity_indicator_flags(); update_display_logic(); return; }
 
     if (strcasecmp(cmd, "ONOFFL") == 0) {
         dispatch_button_event(BTN_ONOFF, true);

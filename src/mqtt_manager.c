@@ -14,6 +14,7 @@
 #include "protocol_json.h"
 #include "protocol_topics.h"
 #include "schedule_manager.h"
+#include "wifi_manager.h"
 
 static app_mqtt_config_t s_config;
 static protocol_topic_bundle_t s_topics;
@@ -59,13 +60,30 @@ esp_err_t mqtt_manager_publish_state(void) {
     device_state_t state = {0};
     char *status_json = NULL;
     char *state_json = NULL;
+    esp_err_t publish_err = ESP_OK;
+
+    if (!s_connected || s_client == NULL) {
+        return ESP_OK;
+    }
 
     ESP_ERROR_CHECK_WITHOUT_ABORT(ihm_mqtt_adapter_get_state(&state));
-    state.connection_mode = s_connected ? APP_CONNECTION_MODE_CLOUD : APP_CONNECTION_MODE_LOCAL_LAN;
+    state.connection_mode = s_connected
+        ? APP_CONNECTION_MODE_CLOUD
+        : (wifi_manager_is_ap_active() ? APP_CONNECTION_MODE_LOCAL_AP : APP_CONNECTION_MODE_LOCAL_LAN);
     ESP_ERROR_CHECK_WITHOUT_ABORT(protocol_json_build_status(s_config.device_id, &state, &status_json));
     ESP_ERROR_CHECK_WITHOUT_ABORT(protocol_json_build_state(s_config.device_id, &state, &state_json));
-    ESP_ERROR_CHECK_WITHOUT_ABORT(publish_json(s_topics.status, status_json, 1, false));
-    ESP_ERROR_CHECK_WITHOUT_ABORT(publish_json(s_topics.state, state_json, 1, false));
+    publish_err = publish_json(s_topics.status, status_json, 1, false);
+    if (publish_err == ESP_ERR_INVALID_STATE) {
+        free(state_json);
+        return ESP_OK;
+    }
+    ESP_ERROR_CHECK_WITHOUT_ABORT(publish_err);
+
+    publish_err = publish_json(s_topics.state, state_json, 1, false);
+    if (publish_err == ESP_ERR_INVALID_STATE) {
+        return ESP_OK;
+    }
+    ESP_ERROR_CHECK_WITHOUT_ABORT(publish_err);
 
     return ESP_OK;
 }
@@ -73,6 +91,10 @@ esp_err_t mqtt_manager_publish_state(void) {
 esp_err_t mqtt_manager_publish_capabilities(void) {
     device_capabilities_t capabilities = {0};
     char *capabilities_json = NULL;
+
+    if (!s_connected || s_client == NULL) {
+        return ESP_OK;
+    }
 
     ESP_ERROR_CHECK_WITHOUT_ABORT(ihm_mqtt_adapter_get_capabilities(&capabilities));
     ESP_ERROR_CHECK_WITHOUT_ABORT(
@@ -85,6 +107,10 @@ esp_err_t mqtt_manager_publish_capabilities(void) {
 esp_err_t mqtt_manager_publish_schedules(void) {
     char *schedules_json = NULL;
     esp_err_t err = schedule_manager_build_payload(s_config.device_id, &schedules_json);
+
+    if (!s_connected || s_client == NULL) {
+        return ESP_OK;
+    }
 
     if (err != ESP_OK) {
         return err;
@@ -106,6 +132,10 @@ static esp_err_t publish_ack(const app_command_t *command, const command_result_
     char *json = NULL;
     const char *topic = result->status == APP_LAST_COMMAND_FAILED ? s_topics.errors : s_topics.events;
 
+    if (!s_connected || s_client == NULL) {
+        return ESP_OK;
+    }
+
     ESP_ERROR_CHECK_WITHOUT_ABORT(ihm_mqtt_adapter_get_state(&state));
     state.connection_mode = APP_CONNECTION_MODE_CLOUD;
     ESP_ERROR_CHECK_WITHOUT_ABORT(
@@ -125,6 +155,10 @@ static esp_err_t publish_ack(const app_command_t *command, const command_result_
 
 static void publish_structured_error(const char *code, const char *message) {
     char *json = NULL;
+
+    if (!s_connected || s_client == NULL) {
+        return;
+    }
 
     if (protocol_json_build_error(s_config.device_id, code, message, &json) == ESP_OK) {
         ESP_ERROR_CHECK_WITHOUT_ABORT(publish_json(s_topics.errors, json, 1, false));

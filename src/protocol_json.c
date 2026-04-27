@@ -438,6 +438,13 @@ esp_err_t protocol_json_parse_command(const char *json, app_command_t *command) 
         payload = NULL;
     }
 
+    if (payload != NULL) {
+        item = cJSON_GetObjectItemCaseSensitive(payload, "behavior");
+        if (cJSON_IsString(item) && strcmp(item->valuestring, "skip-stage") == 0) {
+            command->skip_stage = true;
+        }
+    }
+
     if (command->type == APP_COMMAND_SET_FREQUENCY) {
         item = cJSON_GetObjectItemCaseSensitive(payload, "freqTargetHz");
         if (!cJSON_IsNumber(item)) {

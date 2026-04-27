@@ -29,6 +29,10 @@ static bool s_restart_scheduled;
 
 static void set_json_headers(httpd_req_t *request) {
     httpd_resp_set_type(request, "application/json");
+    httpd_resp_set_hdr(request, "Connection", "close");
+    httpd_resp_set_hdr(request, "Cache-Control", "no-store, no-cache, must-revalidate, max-age=0");
+    httpd_resp_set_hdr(request, "Pragma", "no-cache");
+    httpd_resp_set_hdr(request, "Expires", "0");
 
     if (APP_LOCAL_SERVER_CORS_ENABLED) {
         httpd_resp_set_hdr(request, "Access-Control-Allow-Origin", "*");
@@ -188,6 +192,40 @@ static void build_connection_summary(char *summary, size_t summary_len) {
     } else {
         snprintf(summary, summary_len, "Conectividade indisponivel no momento.");
     }
+}
+
+static void build_iso_timestamp(char *timestamp, size_t timestamp_len) {
+    struct tm tm_value = {0};
+    time_t now = time(NULL);
+
+    if (timestamp == NULL || timestamp_len == 0) {
+        return;
+    }
+
+    gmtime_r(&now, &tm_value);
+    strftime(timestamp, timestamp_len, "%Y-%m-%dT%H:%M:%SZ", &tm_value);
+}
+
+static esp_err_t send_empty_collection_payload(
+    httpd_req_t *request,
+    const char *device_id,
+    const char *collection_name
+) {
+    char timestamp[APP_TIMESTAMP_MAX_LEN + 1] = {0};
+    char response[320] = {0};
+
+    build_iso_timestamp(timestamp, sizeof(timestamp));
+    snprintf(
+        response,
+        sizeof(response),
+        "{\"schema\":\"%s\",\"deviceId\":\"%s\",\"timestamp\":\"%s\",\"source\":\"ihm\",\"%s\":[]}",
+        APP_PROTOCOL_SCHEMA_VERSION,
+        device_id != NULL ? device_id : "",
+        timestamp,
+        collection_name != NULL ? collection_name : "items"
+    );
+
+    return send_json_string(request, "200 OK", response);
 }
 
 static void restart_after_provisioning(void *arg) {
@@ -395,7 +433,76 @@ static esp_err_t schedules_post_handler(httpd_req_t *request) {
     return send_owned_json(request, "200 OK", json);
 }
 
-static esp_err_t provisioning_post_handler(httpd_req_t *request) {
+static esp_err_t events_handler(httpd_req_t *request) {
+    char device_id[APP_DEVICE_ID_MAX_LEN + 1] = {0};
+
+    if (load_current_device_id(device_id, sizeof(device_id)) != ESP_OK) {
+        return send_json_string(request, "500 Internal Server Error", "{\"error\":\"events_unavailable\"}");
+    }
+
+    return send_empty_collection_payload(request, device_id, "events");
+}
+
+static esp_err_t errors_handler(httpd_req_t *request) {
+    char device_id[APP_DEVICE_ID_MAX_LEN + 1] = {0};
+    device_state_t state = {0};
+    char *json = NULL;
+
+    if (load_current_device_id(device_id, sizeof(device_id)) != ESP_OK) {
+        return send_json_string(request, "500 Internal Server Error", "{\"error\":\"errors_unavailable\"}");
+    }
+
+    if (build_local_state(&state) == ESP_OK && state.last_error_code[0] != '\0') {
+        if (
+            protocol_json_build_error(
+                device_id,
+                state.last_error_code,
+                "Erro ativo informado pela IHM.",
+                &json
+            ) == ESP_OK
+        ) {
+            return send_owned_json(request, "200 OK", json);
+        }
+    }
+
+    return send_empty_collection_payload(request, device_id, "errors");
+}
+
+static esp_err_t render_provisioning_status_response(httpd_req_t *request) {
+    app_wifi_provision_result_t result = {0};
+    char response[640] = {0};
+
+    wifi_manager_get_provisioning_result(&result);
+
+    snprintf(
+        response,
+        sizeof(response),
+        "{\"ok\":%s,\"accepted\":%s,\"pending\":%s,\"success\":%s,\"restartRequired\":%s,\"status\":\"%s\",\"code\":\"%s\",\"message\":\"%s\",\"deviceId\":\"%s\",\"firmwareVersion\":\"%s\"}",
+        result.success ? "true" : "false",
+        (result.pending || result.success) ? "true" : "false",
+        result.pending ? "true" : "false",
+        result.success ? "true" : "false",
+        result.restart_required ? "true" : "false",
+        result.status == APP_WIFI_PROVISION_STATUS_CONNECTING ? "connecting" :
+            (result.status == APP_WIFI_PROVISION_STATUS_SUCCESS ? "success" :
+                (result.status == APP_WIFI_PROVISION_STATUS_AUTH_FAILED ? "auth-failed" :
+                    (result.status == APP_WIFI_PROVISION_STATUS_SSID_NOT_FOUND ? "ssid-not-found" :
+                        (result.status == APP_WIFI_PROVISION_STATUS_TIMEOUT ? "timeout" :
+                            (result.status == APP_WIFI_PROVISION_STATUS_ERROR ? "error" : "idle"))))),
+        result.code,
+        result.message,
+        result.device_id,
+        APP_FIRMWARE_VERSION
+    );
+
+    if (result.success && result.restart_required) {
+        schedule_restart_once();
+    }
+
+    return send_json_string(request, "200 OK", response);
+}
+
+static esp_err_t apply_wifi_credentials_post_handler(httpd_req_t *request, const char *success_message) {
     cJSON *root = NULL;
     cJSON *device_id_item = NULL;
     cJSON *wifi_ssid_item = NULL;
@@ -441,32 +548,46 @@ static esp_err_t provisioning_post_handler(httpd_req_t *request) {
         return send_json_string(
             request,
             "400 Bad Request",
-            "{\"ok\":false,\"accepted\":false,\"message\":\"Informe um ID valido e o nome da rede Wi-Fi.\"}"
+            "{\"ok\":false,\"accepted\":false,\"code\":\"invalid_request\",\"message\":\"Informe um ID valido e o nome da rede Wi-Fi.\"}"
         );
     }
 
-    err = comm_storage_save_provisioning(device_id, wifi_ssid, wifi_password);
+    err = wifi_manager_begin_provisioning_attempt(device_id, wifi_ssid, wifi_password);
     cJSON_Delete(root);
 
     if (err != ESP_OK) {
-        ESP_LOGE(LOG_TAG_LOCAL_SERVER, "Falha ao salvar provisionamento: %s", esp_err_to_name(err));
+        ESP_LOGE(LOG_TAG_LOCAL_SERVER, "Falha ao iniciar validacao do Wi-Fi informado: %s", esp_err_to_name(err));
         return send_json_string(
             request,
             "500 Internal Server Error",
-            "{\"ok\":false,\"accepted\":false,\"message\":\"Nao foi possivel salvar o provisionamento na IHM.\"}"
+            "{\"ok\":false,\"accepted\":false,\"code\":\"wifi_validation_start_failed\",\"message\":\"Nao foi possivel iniciar a validacao do Wi-Fi na IHM.\"}"
         );
     }
 
     snprintf(
         response,
         sizeof(response),
-        "{\"ok\":true,\"accepted\":true,\"message\":\"Provisionamento aceito. A IHM vai reiniciar e tentar entrar no Wi-Fi informado.\",\"deviceId\":\"%s\",\"firmwareVersion\":\"%s\"}",
+        "{\"ok\":true,\"accepted\":true,\"pending\":true,\"success\":false,\"message\":\"%s\",\"deviceId\":\"%s\",\"firmwareVersion\":\"%s\"}",
+        success_message,
         device_id,
         APP_FIRMWARE_VERSION
     );
 
-    schedule_restart_once();
     return send_json_string(request, "200 OK", response);
+}
+
+static esp_err_t provisioning_post_handler(httpd_req_t *request) {
+    return apply_wifi_credentials_post_handler(
+        request,
+        "Dados recebidos. A IHM esta validando a rede Wi-Fi informada agora."
+    );
+}
+
+static esp_err_t wifi_reconfigure_post_handler(httpd_req_t *request) {
+    return apply_wifi_credentials_post_handler(
+        request,
+        "Nova rede recebida. A IHM esta validando o Wi-Fi informado antes de concluir a troca."
+    );
 }
 
 static esp_err_t register_endpoint(const httpd_uri_t *route) {
@@ -482,18 +603,26 @@ esp_err_t local_server_start(void) {
         {.uri = "/api/v1/state", .method = HTTP_GET, .handler = state_handler, .user_ctx = NULL},
         {.uri = "/api/v1/capabilities", .method = HTTP_GET, .handler = capabilities_handler, .user_ctx = NULL},
         {.uri = "/api/v1/diagnostics", .method = HTTP_GET, .handler = diagnostics_handler, .user_ctx = NULL},
+        {.uri = "/api/v1/events", .method = HTTP_GET, .handler = events_handler, .user_ctx = NULL},
+        {.uri = "/api/v1/errors", .method = HTTP_GET, .handler = errors_handler, .user_ctx = NULL},
         {.uri = "/api/v1/schedules", .method = HTTP_GET, .handler = schedules_get_handler, .user_ctx = NULL},
+        {.uri = "/api/v1/provisioning/status", .method = HTTP_GET, .handler = render_provisioning_status_response, .user_ctx = NULL},
         {.uri = "/api/v1/commands", .method = HTTP_POST, .handler = commands_post_handler, .user_ctx = NULL},
         {.uri = "/api/v1/schedules", .method = HTTP_POST, .handler = schedules_post_handler, .user_ctx = NULL},
         {.uri = "/api/v1/provisioning", .method = HTTP_POST, .handler = provisioning_post_handler, .user_ctx = NULL},
+        {.uri = "/api/v1/wifi/reconfigure", .method = HTTP_POST, .handler = wifi_reconfigure_post_handler, .user_ctx = NULL},
         {.uri = "/api/v1/commands", .method = HTTP_OPTIONS, .handler = options_handler, .user_ctx = NULL},
         {.uri = "/api/v1/schedules", .method = HTTP_OPTIONS, .handler = options_handler, .user_ctx = NULL},
         {.uri = "/api/v1/provisioning", .method = HTTP_OPTIONS, .handler = options_handler, .user_ctx = NULL},
+        {.uri = "/api/v1/provisioning/status", .method = HTTP_OPTIONS, .handler = options_handler, .user_ctx = NULL},
+        {.uri = "/api/v1/wifi/reconfigure", .method = HTTP_OPTIONS, .handler = options_handler, .user_ctx = NULL},
         {.uri = "/api/v1/ping", .method = HTTP_OPTIONS, .handler = options_handler, .user_ctx = NULL},
         {.uri = "/api/v1/status", .method = HTTP_OPTIONS, .handler = options_handler, .user_ctx = NULL},
         {.uri = "/api/v1/state", .method = HTTP_OPTIONS, .handler = options_handler, .user_ctx = NULL},
         {.uri = "/api/v1/capabilities", .method = HTTP_OPTIONS, .handler = options_handler, .user_ctx = NULL},
         {.uri = "/api/v1/diagnostics", .method = HTTP_OPTIONS, .handler = options_handler, .user_ctx = NULL},
+        {.uri = "/api/v1/events", .method = HTTP_OPTIONS, .handler = options_handler, .user_ctx = NULL},
+        {.uri = "/api/v1/errors", .method = HTTP_OPTIONS, .handler = options_handler, .user_ctx = NULL},
     };
 
     if (s_http_server != NULL) {
@@ -501,9 +630,10 @@ esp_err_t local_server_start(void) {
     }
 
     config.server_port = APP_LOCAL_SERVER_PORT_DEFAULT;
-    config.max_uri_handlers = 24;
+    config.max_uri_handlers = 32;
     config.recv_wait_timeout = 10;
     config.send_wait_timeout = 10;
+    config.lru_purge_enable = true;
 
     ESP_RETURN_ON_ERROR(httpd_start(&s_http_server, &config), LOG_TAG_LOCAL_SERVER, "httpd start");
 

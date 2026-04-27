@@ -113,6 +113,27 @@ typedef struct {
     uint8_t max_retry;
 } app_wifi_config_t;
 
+typedef enum {
+    APP_WIFI_PROVISION_STATUS_IDLE = 0,
+    APP_WIFI_PROVISION_STATUS_CONNECTING,
+    APP_WIFI_PROVISION_STATUS_SUCCESS,
+    APP_WIFI_PROVISION_STATUS_AUTH_FAILED,
+    APP_WIFI_PROVISION_STATUS_SSID_NOT_FOUND,
+    APP_WIFI_PROVISION_STATUS_TIMEOUT,
+    APP_WIFI_PROVISION_STATUS_ERROR
+} app_wifi_provision_status_t;
+
+typedef struct {
+    bool pending;
+    bool success;
+    bool restart_required;
+    app_wifi_provision_status_t status;
+    char code[APP_CODE_MAX_LEN + 1];
+    char message[APP_MESSAGE_MAX_LEN + 1];
+    char device_id[APP_DEVICE_ID_MAX_LEN + 1];
+    char wifi_ssid[APP_SSID_MAX_LEN + 1];
+} app_wifi_provision_result_t;
+
 typedef struct {
     bool enabled;
     bool use_tls;
@@ -166,6 +187,7 @@ typedef struct {
     app_command_type_t type;
     app_command_source_t source;
     time_t timestamp;
+    bool skip_stage;
     int freq_target_hz;
     bool enabled;
     char reason[APP_MESSAGE_MAX_LEN + 1];
