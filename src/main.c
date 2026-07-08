@@ -1,4 +1,4 @@
-﻿#include <stdio.h>
+#include <stdio.h>
 #include <stdlib.h>
 #include <stdint.h>
 #include <stdbool.h>
@@ -31,54 +31,35 @@
 static const char *TAG = "IHM_AXON";
 
 /* ============================================================
- * HARDWARE FIXO PEDIDO PELO USUÃRIO
- * - Pinos do display mantidos
- * - Pinos da comunicaÃ§Ã£o mantidos
- * - BotÃµes fÃ­sicos apenas comentados para referÃªncia
+ * HARDWARE ESP32-S3-WROOM-1-N8
+ * Pinagem conforme mapeamento informado para a nova placa.
  * ============================================================ */
 
-/* -------- Display 7 segmentos (cÃ¡todo comum) -------- */
-#define SEG_A               GPIO_NUM_13
+/* -------- Display 7 segmentos (catodo comum) -------- */
+#define SEG_A               GPIO_NUM_7
 #define SEG_B               GPIO_NUM_15
-#define SEG_C               GPIO_NUM_14
-#define SEG_D               GPIO_NUM_27
-#define SEG_E               GPIO_NUM_26
-#define SEG_F               GPIO_NUM_25
-#define SEG_G               GPIO_NUM_33
-#define SEG_DP              GPIO_NUM_32
+#define SEG_C               GPIO_NUM_16
+#define SEG_D               GPIO_NUM_17
+#define SEG_E               GPIO_NUM_18
+#define SEG_F               GPIO_NUM_8
+#define SEG_G               GPIO_NUM_19
+#define SEG_DP              GPIO_NUM_20
 
-#define DIGIT_1             GPIO_NUM_23
-#define DIGIT_2             GPIO_NUM_22
-#define DIGIT_3             GPIO_NUM_21
+#define DIGIT_1             GPIO_NUM_4
+#define DIGIT_2             GPIO_NUM_5
 
-/* -------- ComunicaÃ§Ã£o RS485 com MI -------- */
+/* -------- Comunicacao RS485 com MI -------- */
 #define RS485_UART          UART_NUM_2
-#define RS485_TX_PIN        GPIO_NUM_17
-#define RS485_RX_PIN        GPIO_NUM_16
-#define RS485_EN_PIN        GPIO_NUM_4
+#define RS485_RX_PIN        GPIO_NUM_36
+#define RS485_TX_PIN        GPIO_NUM_37
+#define RS485_EN_PIN        GPIO_NUM_38
 #define RS485_BAUD          115200
 
-/* -------- LEDs remapeados --------
- * Os pinos 21/22/23 do cÃ³digo de perifÃ©ricos conflitam com os dÃ­gitos do display.
- * Por isso os LEDs foram realocados.
- * ObservaÃ§Ã£o: GPIO0 Ã© pino de strap; mantenha-o em nÃ­vel alto no boot.
+/* -------- Botoes fisicos --------
+ * Nao ha botoes GPIO ativos neste firmware; comandos locais seguem pelo console.
  */
-#define LED_ACTIVE_ON       0
-#define LED_ACTIVE_OFF      1
-#define LED_SWING_PIN       GPIO_NUM_18
-#define LED_DRENO_PIN       GPIO_NUM_19
-#define LED_CLIMA_PIN       GPIO_NUM_2
-#define LED_VENT_PIN        GPIO_NUM_5
-#define LED_EXAUSTAO_PIN    GPIO_NUM_0
 
-/* -------- BotÃµes fÃ­sicos (somente referÃªncia, NÃƒO usados) --------
-static const gpio_num_t BTN_PINS[] = {
-    GPIO_NUM_32, GPIO_NUM_33, GPIO_NUM_25, GPIO_NUM_26, GPIO_NUM_27,
-    GPIO_NUM_14, GPIO_NUM_12, GPIO_NUM_13, GPIO_NUM_4, GPIO_NUM_5
-};
-*/
-
-#define TOTAL_DIGITS            3
+#define TOTAL_DIGITS            2
 #define MULTIPLEX_INTERVAL_US   4000
 #define BLINK_INTERVAL_MS       400
 #define BUTTON_PULSE_MS         250
@@ -105,8 +86,11 @@ static const gpio_num_t BTN_PINS[] = {
 #define ESC                     0x7D
 #define ESC_XOR                 0x20
 #define ADDR_STM32              0x01
+#define ADDR_MASTER             0xF0
 #define TYPE_READ_STATUS        0x04
 #define TYPE_WRITE_PARAM        0x05
+#define TYPE_ACK_MI             0x06
+#define TYPE_ACK                0x80
 
 #define BTN_BIT_START           (1u << 0)
 #define BTN_BIT_STOP            (1u << 1)
@@ -146,7 +130,7 @@ typedef enum {
 
 typedef enum {
     DRENO_IDLE = 0,
-    DRENO_AGUARDANDO_LED,
+    DRENO_AGUARDANDO_RETORNO,
     DRENO_EM_CURSO
 } dreno_state_t;
 
@@ -274,12 +258,8 @@ static const gpio_num_t segment_pins[7] = {
     SEG_A, SEG_B, SEG_C, SEG_D, SEG_E, SEG_F, SEG_G
 };
 static const gpio_num_t digit_pins[TOTAL_DIGITS] = {
-    DIGIT_1, DIGIT_2, DIGIT_3
+    DIGIT_1, DIGIT_2
 };
-static const gpio_num_t led_pins[5] = {
-    LED_SWING_PIN, LED_DRENO_PIN, LED_CLIMA_PIN, LED_VENT_PIN, LED_EXAUSTAO_PIN
-};
-
 static portMUX_TYPE meas_mux = portMUX_INITIALIZER_UNLOCKED;
 static portMUX_TYPE status_mux = portMUX_INITIALIZER_UNLOCKED;
 
@@ -342,7 +322,7 @@ static float output_frequency = 0.0f;       /* Hz */
 
 static bool blink_visible = true;
 static bool dp_blink_visible = true;
-static uint8_t display_buffer[3] = {0, 0, 0};
+static uint8_t display_buffer[TOTAL_DIGITS] = {0};
 
 #define ERR_HIST_SIZE 5
 static uint8_t err_hist[ERR_HIST_SIZE] = {0};
@@ -363,7 +343,7 @@ static int64_t g_button_pulse_until_us = 0;
 static uint8_t g_direction = 0; /* 0=FWD, 1=REV */
 
 static void update_display_logic(void);
-static void update_leds(void);
+static void update_indicators(void);
 static void dreno_service(void);
 static void phase_service(void);
 static void exaustao_service(void);
@@ -695,34 +675,37 @@ static void error_history_push(uint8_t code) {
 }
 
 /* ============================================================
- * DISPLAY E LEDs
+ * DISPLAY E INDICADORES LOGICOS
  * ============================================================ */
 
-static void update_leds(void) {
+static void set_display_chars(char left, char right) {
+    display_buffer[0] = get_char_pattern(left);
+    display_buffer[1] = get_char_pattern(right);
+}
+
+static void set_display_number2(int value, bool blank_leading_zero) {
+    if (value < 0) {
+        value = 0;
+    }
+
+    value %= 100;
+    display_buffer[0] = (value >= 10 || !blank_leading_zero)
+        ? get_char_pattern((value / 10) + '0')
+        : get_char_pattern(' ');
+    display_buffer[1] = get_char_pattern((value % 10) + '0');
+}
+
+static void set_display_error2(int code) {
+    if (code >= 0 && code <= 9) {
+        set_display_chars('E', (char)('0' + code));
+        return;
+    }
+
+    set_display_number2(code, false);
+}
+
+static void update_indicators(void) {
     normalize_local_modes_by_params();
-
-    if (dreno_status != DRENO_IDLE || dreno_post_wait_active) {
-        gpio_set_level(LED_SWING_PIN,    LED_ACTIVE_OFF);
-        gpio_set_level(LED_DRENO_PIN,    LED_ACTIVE_ON);
-        gpio_set_level(LED_CLIMA_PIN,    LED_ACTIVE_OFF);
-        gpio_set_level(LED_VENT_PIN,     LED_ACTIVE_OFF);
-        gpio_set_level(LED_EXAUSTAO_PIN, LED_ACTIVE_OFF);
-        return;
-    }
-
-    if (!system_on) {
-        for (int i = 0; i < 5; i++) {
-            gpio_set_level(led_pins[i], LED_ACTIVE_OFF);
-        }
-        return;
-    }
-
-    bool motor_active_ui = (motor_running || output_frequency > 0.1f) && !prewet_active && !dryrun_active;
-    gpio_set_level(LED_SWING_PIN,    (swing_on && motor_active_ui) ? LED_ACTIVE_ON : LED_ACTIVE_OFF);
-    gpio_set_level(LED_DRENO_PIN,    LED_ACTIVE_OFF);
-    gpio_set_level(LED_CLIMA_PIN,    (bomba_on && !exaustao_on) ? LED_ACTIVE_ON : LED_ACTIVE_OFF);
-    gpio_set_level(LED_VENT_PIN,     (!bomba_on && !exaustao_on) ? LED_ACTIVE_ON : LED_ACTIVE_OFF);
-    gpio_set_level(LED_EXAUSTAO_PIN, exaustao_on ? LED_ACTIVE_ON : LED_ACTIVE_OFF);
 }
 
 static void refresh_run_ready_state_from_output(void) {
@@ -746,30 +729,22 @@ static void update_display_logic(void) {
 
     if (current_state != STATE_ERROR && current_state != STATE_MENU_SEL && current_state != STATE_MENU_EDIT) {
         if (prewet_active) {
-            display_buffer[0] = get_char_pattern('L');
-            display_buffer[1] = get_char_pattern('I');
-            display_buffer[2] = get_char_pattern('P');
+            set_display_chars('L', 'I');
             return;
         }
         if (dryrun_active) {
-            display_buffer[0] = get_char_pattern('S');
-            display_buffer[1] = get_char_pattern('E');
-            display_buffer[2] = get_char_pattern('C');
+            set_display_chars('S', 'E');
             return;
         }
         if (dreno_status != DRENO_IDLE || dreno_post_wait_active) {
-            display_buffer[0] = get_char_pattern('D');
-            display_buffer[1] = get_char_pattern('R');
-            display_buffer[2] = get_char_pattern('N');
+            set_display_chars('D', 'R');
             return;
         }
     }
 
     switch (current_state) {
         case STATE_READY:
-            display_buffer[0] = get_char_pattern('R');
-            display_buffer[1] = get_char_pattern('D');
-            display_buffer[2] = get_char_pattern('Y');
+            set_display_chars('R', 'D');
             return;
 
         case STATE_RUN:
@@ -777,9 +752,7 @@ static void update_display_logic(void) {
             break;
 
         case STATE_MENU_SEL:
-            display_buffer[0] = get_char_pattern('P');
-            display_buffer[1] = get_char_pattern((params[current_param_idx].id / 10) % 10 + '0');
-            display_buffer[2] = get_char_pattern(params[current_param_idx].id % 10 + '0');
+            set_display_number2(params[current_param_idx].id, false);
             return;
 
         case STATE_MENU_EDIT: {
@@ -787,9 +760,7 @@ static void update_display_logic(void) {
 
             if (p_id == 6) {
                 int e = (int)err_hist_get_by_offset(err_view_offset);
-                display_buffer[0] = get_char_pattern('E');
-                display_buffer[1] = get_char_pattern((e / 10) % 10 + '0');
-                display_buffer[2] = get_char_pattern(e % 10 + '0');
+                set_display_error2(e);
                 return;
             }
 
@@ -802,21 +773,11 @@ static void update_display_logic(void) {
         } break;
 
         case STATE_ERROR:
-            display_buffer[0] = get_char_pattern('E');
-            display_buffer[1] = get_char_pattern((current_error_code / 10) % 10 + '0');
-            display_buffer[2] = get_char_pattern(current_error_code % 10 + '0');
+            set_display_error2(current_error_code);
             return;
     }
 
-    display_buffer[0] = (val >= 100) ? get_char_pattern((val / 100) % 10 + '0') : get_char_pattern(' ');
-    display_buffer[1] = (val >= 10)  ? get_char_pattern((val / 10) % 10 + '0') : get_char_pattern(' ');
-    display_buffer[2] = get_char_pattern(val % 10 + '0');
-
-    if (val == 0) {
-        display_buffer[0] = get_char_pattern(' ');
-        display_buffer[1] = get_char_pattern(' ');
-        display_buffer[2] = get_char_pattern('0');
-    }
+    set_display_number2(val, true);
 }
 
 static void multiplex_timer_callback(void *arg) {
@@ -875,7 +836,7 @@ static void multiplex_timer_callback(void *arg) {
 
         bool dp_state =
             (current_pos == 0 && water_shortage && dp_blink_visible) ||
-            (current_pos == 2 && wifi_lost      && dp_blink_visible);
+            (current_pos == (TOTAL_DIGITS - 1) && wifi_lost && dp_blink_visible);
         gpio_set_level(SEG_DP, dp_state ? 1 : 0);
 
         gpio_set_level(digit_pins[current_pos], 1);
@@ -919,7 +880,7 @@ static void enter_error(int code) {
     system_on = false;
     pulse_buttons(BTN_BIT_STOP);
     update_display_logic();
-    update_leds();
+    update_indicators();
 }
 
 static void clear_error_manual_ack(void) {
@@ -952,7 +913,7 @@ static void clear_error_manual_ack(void) {
     normalize_local_modes_by_params();
     refresh_run_ready_state_from_output();
     update_display_logic();
-    update_leds();
+    update_indicators();
 }
 
 static void clear_error_auto(void) {
@@ -990,7 +951,7 @@ static void clear_error_auto(void) {
     }
 
     update_display_logic();
-    update_leds();
+    update_indicators();
 }
 
 /* ============================================================
@@ -1131,6 +1092,32 @@ static inline void rs485_set_tx(bool en) {
     gpio_set_level(RS485_EN_PIN, en ? 1 : 0);
 }
 
+static bool frame_is_local_echo(const frame_t *frame, uint8_t type, uint8_t seq,
+                                const uint8_t *payload, uint8_t len) {
+    if (frame == NULL) {
+        return false;
+    }
+
+    if (frame->addr != ADDR_STM32 || frame->type != type ||
+        frame->seq != seq || frame->len != len) {
+        return false;
+    }
+
+    if (len == 0) {
+        return true;
+    }
+
+    return payload != NULL && memcmp(frame->payload, payload, len) == 0;
+}
+
+static uint8_t expected_reply_type(uint8_t request_type) {
+    switch (request_type) {
+        case TYPE_WRITE_PARAM: return TYPE_ACK_MI;
+        case TYPE_READ_STATUS: return TYPE_ACK;
+        default: return 0u;
+    }
+}
+
 static void status_touch(void) {
     portENTER_CRITICAL(&status_mux);
     last_status_rx_us = esp_timer_get_time();
@@ -1143,14 +1130,17 @@ static bool rs485_request(uint8_t type, const uint8_t *payload, uint8_t len,
                           frame_t *reply, uint32_t timeout_ms) {
     static uint8_t seq = 0;
     seq++;
+    int64_t deadline_us = esp_timer_get_time() + ((int64_t)timeout_ms * 1000LL);
 
     uint8_t txbuf[MAX_FRAME_ESC];
     size_t txlen = build_frame(ADDR_STM32, type, seq, payload, len, txbuf, sizeof(txbuf));
+    uint8_t expected_type = expected_reply_type(type);
 
     frame_t dump;
     while (xQueueReceive(g_frame_q, &dump, 0) == pdTRUE) {
         /* flush */
     }
+    uart_flush_input(RS485_UART);
 
     rs485_set_tx(true);
     esp_rom_delay_us(50);
@@ -1158,9 +1148,34 @@ static bool rs485_request(uint8_t type, const uint8_t *payload, uint8_t len,
     uart_wait_tx_done(RS485_UART, pdMS_TO_TICKS(100));
     rs485_set_tx(false);
 
-    frame_t fr;
-    if (xQueueReceive(g_frame_q, &fr, pdMS_TO_TICKS(timeout_ms)) == pdTRUE) {
+    while (esp_timer_get_time() < deadline_us) {
+        int64_t remaining_us = deadline_us - esp_timer_get_time();
+        TickType_t wait_ticks = pdMS_TO_TICKS((uint32_t)((remaining_us + 999LL) / 1000LL));
+        frame_t fr;
+
+        if (wait_ticks == 0) {
+            wait_ticks = 1;
+        }
+
+        if (xQueueReceive(g_frame_q, &fr, wait_ticks) != pdTRUE) {
+            break;
+        }
+
+        if (fr.seq == seq && frame_is_local_echo(&fr, type, seq, payload, len)) {
+            if (g_show_logs) {
+                ESP_LOGW(TAG, "Eco local RS485 descartado: type=0x%02X seq=%u len=%u", type, seq, len);
+            }
+            continue;
+        }
+
         if (fr.seq == seq) {
+            if (fr.addr != ADDR_MASTER || (expected_type != 0u && fr.type != expected_type)) {
+                if (g_show_logs) {
+                    ESP_LOGW(TAG, "Resposta RS485 ignorada: addr=0x%02X type=0x%02X seq=%u len=%u",
+                             fr.addr, fr.type, fr.seq, fr.len);
+                }
+                continue;
+            }
             if (reply) *reply = fr;
             return true;
         }
@@ -1301,10 +1316,10 @@ static void ihm_sync_task(void *arg) {
         }
 
         if (rs485_request(TYPE_READ_STATUS, tx_payload, 9, &rep, 120)) {
-            status_touch();
-            maybe_clear_button_pulse_after_tx();
-
             if (rep.len >= 9) {
+                status_touch();
+                maybe_clear_button_pulse_after_tx();
+
                 portENTER_CRITICAL(&meas_mux);
                 g_telemetry.current_freq_centi_hz = (uint16_t)((rep.payload[0] << 8) | rep.payload[1]);
                 g_telemetry.i_out = (uint16_t)((rep.payload[2] << 8) | rep.payload[3]);
@@ -1341,13 +1356,15 @@ static void ihm_sync_task(void *arg) {
                     ESP_LOGI(TAG, "Sincronizando pendÃªncias com o MI...");
                     sync_params_to_mi(false);
                 }
+            } else if (g_show_logs) {
+                ESP_LOGW(TAG, "Resposta MI invalida: type=0x%02X seq=%u len=%u", rep.type, rep.seq, rep.len);
             }
         } else if (g_show_logs) {
             ESP_LOGW(TAG, "Timeout MI");
         }
 
         update_display_logic();
-        update_leds();
+        update_indicators();
         vTaskDelay(pdMS_TO_TICKS(200));
     }
 }
@@ -1615,7 +1632,7 @@ static void apply_menu_enter_or_confirm(void) {
                 exaustao_exit_pending = false;
                 current_state = STATE_READY;
                 g_direction = (uint8_t)params[IDX_P51].value;
-                update_leds();
+                update_indicators();
                 update_display_logic();
 
                 for (int i = 0; i < PARAM_COUNT; i++) {
@@ -1723,7 +1740,7 @@ static void finish_prewet_now(void) {
     current_state = STATE_RUN;
     pulse_buttons(BTN_BIT_START);
     update_display_logic();
-    update_leds();
+    update_indicators();
 }
 
 static void finish_dryrun_now(bool immediate_stop) {
@@ -1739,7 +1756,7 @@ static void finish_dryrun_now(bool immediate_stop) {
         pulse_buttons(BTN_BIT_STOP);
         current_state = (output_frequency > 0.1f) ? STATE_RUN : STATE_READY;
         update_display_logic();
-        update_leds();
+        update_indicators();
         ESP_LOGW(TAG, "Secagem P31: aguardando motor parar para restaurar o sentido.");
         return;
     }
@@ -1760,7 +1777,7 @@ static void finish_dryrun_now(bool immediate_stop) {
         current_state = STATE_READY;
     }
     update_display_logic();
-    update_leds();
+    update_indicators();
 }
 
 static void force_finish_all_timed_cycles(void) {
@@ -1797,7 +1814,7 @@ static void phase_service(void) {
         current_state = STATE_RUN;
         pulse_buttons(BTN_BIT_START);
         update_display_logic();
-        update_leds();
+        update_indicators();
         ESP_LOGW(TAG, "Secagem P31: motor religado em sentido invertido.");
         return;
     }
@@ -1811,7 +1828,7 @@ static void phase_service(void) {
         }
         current_state = STATE_READY;
         update_display_logic();
-        update_leds();
+        update_indicators();
         ESP_LOGW(TAG, "Secagem P31: sentido restaurado com o motor parado.");
         return;
     }
@@ -1841,7 +1858,7 @@ static void exaustao_service(void) {
             exaustao_end_us = 0;
         }
         update_display_logic();
-        update_leds();
+        update_indicators();
         ESP_LOGW(TAG, "ExaustÃ£o: motor religado em sentido invertido.");
         return;
     }
@@ -1868,7 +1885,7 @@ static void exaustao_service(void) {
         saved_resume_exaustao_on = false;
         exaustao_pending_direction = (uint8_t)params[IDX_P51].value;
         update_display_logic();
-        update_leds();
+        update_indicators();
         ESP_LOGW(TAG, "ExaustÃ£o finalizada: sistema voltou para pronto.");
     }
 }
@@ -1954,7 +1971,7 @@ static void set_motor_running_ex(bool run, bool skip_timers) {
         }
     }
     update_display_logic();
-    update_leds();
+    update_indicators();
 }
 
 static void request_exaustao_stop(void) {
@@ -1987,11 +2004,11 @@ static void request_exaustao_stop(void) {
         ESP_LOGW(TAG, "Saindo da exaustÃ£o: sistema voltou ao pronto.");
     }
     update_display_logic();
-    update_leds();
+    update_indicators();
 }
 
 static void handle_dreno_end(void) {
-    if (dreno_status == DRENO_EM_CURSO || dreno_status == DRENO_AGUARDANDO_LED || dreno_post_wait_active) {
+    if (dreno_status == DRENO_EM_CURSO || dreno_status == DRENO_AGUARDANDO_RETORNO || dreno_post_wait_active) {
         /* Preserve the peripheral state that existed before dreno started.
          * set_motor_running_ex(false, ...) normally snapshots the CURRENT states,
          * but during dreno they are intentionally forced off. If we do not preserve
@@ -2025,7 +2042,7 @@ static void handle_dreno_end(void) {
 
         current_state = STATE_READY;
         ESP_LOGW(TAG, "MI informou fim do dreno.");
-        update_leds();
+        update_indicators();
         update_display_logic();
     }
 }
@@ -2040,7 +2057,7 @@ static void dreno_service(void) {
         dreno_post_wait_active = true;
         dreno_ready_release_us = now + ((int64_t)params[IDX_P84].value * 60LL * 1000000LL);
         ESP_LOGW(TAG, "Tempo de dreno P83 concluÃ­do. Aguardando P84 para voltar ao pronto...");
-        update_leds();
+        update_indicators();
         update_display_logic();
     }
 
@@ -2054,7 +2071,7 @@ static void dreno_service(void) {
         swing_on = false;
         exaustao_on = false;
         refresh_run_ready_state_from_output();
-        update_leds();
+        update_indicators();
         update_display_logic();
         ESP_LOGW(TAG, "Ciclo de dreno concluÃ­do. Estado pronto liberado.");
     }
@@ -2155,7 +2172,7 @@ static void handle_button_event(button_id_t id, bool long_press) {
         dreno_post_wait_active = false;
         dreno_auto_off_us = 0;
         dreno_ready_release_us = 0;
-        update_leds();
+        update_indicators();
         return;
     }
 
@@ -2336,7 +2353,7 @@ static void handle_button_event(button_id_t id, bool long_press) {
             break;
     }
 
-    update_leds();
+    update_indicators();
     update_display_logic();
 }
 
@@ -2591,17 +2608,7 @@ void app_main(void) {
     };
     ESP_ERROR_CHECK(gpio_config(&io_display));
 
-    uint64_t leds_mask = 0;
-    for (int i = 0; i < 5; i++) leds_mask |= (1ULL << led_pins[i]);
-    gpio_config_t io_leds = {
-        .mode = GPIO_MODE_OUTPUT,
-        .pin_bit_mask = leds_mask,
-        .pull_down_en = GPIO_PULLDOWN_DISABLE,
-        .pull_up_en = GPIO_PULLUP_DISABLE,
-        .intr_type = GPIO_INTR_DISABLE
-    };
-    ESP_ERROR_CHECK(gpio_config(&io_leds));
-    update_leds();
+    update_indicators();
 
     nvs_init_and_open();
     nvs_load_all();

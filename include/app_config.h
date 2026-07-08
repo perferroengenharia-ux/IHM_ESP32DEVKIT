@@ -2,7 +2,7 @@
 #define APP_CONFIG_H
 
 #define APP_PROTOCOL_SCHEMA_VERSION "axon.ihm.v1"
-#define APP_FIRMWARE_VERSION "ihm-devkit-v1-comm-0.1.0"
+#define APP_FIRMWARE_VERSION "ihm-esp32-s3-n8-comm-0.1.0"
 
 #define APP_DEVICE_ID_MAX_LEN 48
 #define APP_TOPIC_PREFIX_MAX_LEN 64
